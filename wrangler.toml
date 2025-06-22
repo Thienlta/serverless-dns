@@ -40,9 +40,9 @@ CLOUD_PLATFORM = "cloudflare"
 name = "basic-unbound"
 minify = true
 routes = [
-  "sky.rethinkdns.com/*",
-  "sky.bravedns.com/*",
-  "basic.rethinkdns.com/*",
+  "serverless-dns.vncf.workers.dev/*",
+  "vncf.pages.dev/*",
+  "ddns.vncf.workers.dev/*",
   "basic.bravedns.com/*",
   "free.bravedns.com/*",
 ]
@@ -63,6 +63,7 @@ minify = true
 routes = [
   "one.rethinkdns.com/*",
   "one.bravedns.com/*",
+  "vncf.pages.dev/*",
 ]
 analytics_engine_datasets = [
     { binding = "METRICS", dataset = "ONE_M0" },
