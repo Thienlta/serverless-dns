@@ -41,10 +41,8 @@ name = "basic-unbound"
 minify = true
 routes = [
   "serverless-dns.vncf.workers.dev/*",
-  "vncf.pages.dev/*",
+  "cloudflare-docs-c5s.pages.dev/*",
   "ddns.vncf.workers.dev/*",
-  "basic.bravedns.com/*",
-  "free.bravedns.com/*",
 ]
 # vars are not inherited
 # workers/platform/environment-variables#environment-variables-via-wrangler
