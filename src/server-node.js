@@ -28,11 +28,12 @@ import * as dnsutil from "./commons/dnsutil.js";
 import * as envutil from "./commons/envutil.js";
 import * as util from "./commons/util.js";
 import { handleRequest } from "./core/doh.js";
+import { loggerWithTags } from "./core/log.js";
 import { setTlsVars } from "./core/node/config.js";
 import * as nodeutil from "./core/node/util.js";
+import * as psk from "./core/psk.js";
 import { stopAfter, uptime } from "./core/svc.js";
 import * as system from "./system.js";
-
 /**
  * @typedef {net.Socket} Socket
  * @typedef {http2.Http2ServerRequest} Http2ServerRequest
@@ -50,6 +51,10 @@ class Stats {
     this.noreqs = -1;
     this.nofchecks = 0;
     this.tlserr = 0;
+    this.tlspsks = 0;
+    this.tlspskd = 0;
+    this.tlspskmiss = 0;
+    this.tottlspsk = 0;
     this.fasttls = 0;
     this.totfasttls = 0;
     this.noftlsadjs = 0;
@@ -66,8 +71,9 @@ class Stats {
     return (
       `reqs=${this.noreqs} c=${this.nofchecks} ` +
       `drops=${this.nofdrops}/tot=${this.nofconns}/open=${this.openconns} ` +
-      `to=${this.noftimeouts}/tlserr=${this.tlserr} ` +
+      `to=${this.noftimeouts}/tlserr=${this.tlserr}/tlspskmiss=${this.tlspskmiss} ` +
       `tls0=${this.fasttls}/tls0miss=${this.totfasttls}/tlsadjs=${this.noftlsadjs} ` +
+      `tlspsks=${this.tlspsks}/tlspskd=${this.tlspskd}/tlspsktot=${this.tottlspsk} ` +
       `n=${this.bp[4]}/adj=${this.bp[3]} ` +
       `load=${this.bp[0]}/${this.bp[1]}/${this.bp[2]}`
     );
@@ -260,7 +266,7 @@ function systemDown() {
   util.timeout(shutdownTimeoutMs, bye);
 
   if (adjTimer) clearInterval(adjTimer);
-  // 0 is ignored; github.com/nodejs/node/pull/48276
+  // 0 was ignored; github.com/nodejs/node/pull/48276
   // accept only 1 conn (which keeps health-checks happy)
   adjustMaxConns(1);
 
@@ -289,7 +295,7 @@ function systemDown() {
 }
 
 function systemUp() {
-  log = util.logger("NodeJs");
+  log = loggerWithTags("NodeJs");
   if (!log) throw new Error("logger unavailable on system up");
 
   const downloadmode = envutil.blocklistDownloadOnly();
@@ -302,6 +308,22 @@ function systemUp() {
   const ioTimeoutMs = envutil.ioTimeoutMs();
   const supportsHttp2 = envutil.isNode() || envutil.isDeno();
   const isBun = envutil.isBun();
+  const allowTlsPsk = envutil.allowTlsPsk();
+  let tlsPsk = null;
+  if (allowTlsPsk) {
+    const pskhex = envutil.tlsPskHex();
+    if (pskhex == null) {
+      log.w(
+        "TLS_PSK not set; using per-process session random",
+        psk.staticPskCred.idhexhint,
+        bufutil.len(psk.staticPskCred.key),
+        "bytes"
+      );
+    } else {
+      tlsPsk = bufutil.hex2buf(pskhex);
+      log.i("TLS PSK configured", bufutil.len(tlsPsk), "bytes");
+    }
+  }
 
   if (downloadmode) {
     log.i("in download mode, not running the dns resolver");
@@ -322,31 +344,86 @@ function systemUp() {
     noDelay: true,
   };
   // default cipher suites
-  // nodejs.org/api/tls.html#modifying-the-default-tls-cipher-suite
-  let defaultTlsCiphers = "";
-  if (!util.emptyString(tls.DEFAULT_CIPHERS)) {
-    // nodejs.org/api/tls.html#tlsdefault_ciphers
-    defaultTlsCiphers = tls.DEFAULT_CIPHERS;
-  } else {
-    // nodejs.org/api/tls.html#tlsgetciphers
-    defaultTlsCiphers = tls
-      .getCiphers()
-      .map((c) => c.toUpperCase())
-      .join(":");
-  }
+  // nodejs.org/api/tls.html#tlsdefault_ciphers
+  // nodejs.org/api/tls.html#tlsgetciphers
+  const ciphers = !util.emptyString(tls.DEFAULT_CIPHERS)
+    ? tls.DEFAULT_CIPHERS.split(":")
+    : tls.getCiphers();
+  // defaultTlsCiphers contains "!PSK" and so, this must be appended before it.
+  const defaultTlsCiphers = ciphers
+    .map((c) => c.toUpperCase())
+    .filter((c) => !c.startsWith("!PSK"))
+    .join(":");
   // aes128 is a 'cipher string' for tls1.2 and below
   // docs.openssl.org/1.1.1/man1/ciphers/#cipher-strings
-  const preferAes128 =
-    "AES128:TLS_AES_128_CCM_SHA256:TLS_AES_128_CCM_8_SHA256:TLS_AES_128_GCM_SHA256";
+  let preferAes128 =
+    "TLS_AES_128_CCM_SHA256:TLS_AES_128_CCM_8_SHA256:TLS_AES_128_GCM_SHA256:AES128";
+  if (allowTlsPsk) {
+    preferAes128 = preferAes128 + ":aPSK";
+  } else {
+    preferAes128 = preferAes128 + ":!PSK";
+  }
+  log.d(preferAes128 + ":" + defaultTlsCiphers);
   // nodejs.org/api/tls.html#tlscreateserveroptions-secureconnectionlistener
   /** @type {tls.TlsOptions} */
   const tlsOpts = {
+    // nodejs.org/api/tls.html#modifying-the-default-tls-cipher-suite
     ciphers: preferAes128 + ":" + defaultTlsCiphers,
     honorCipherOrder: true,
     handshakeTimeout: Math.max((ioTimeoutMs / 2) | 0, 3 * 1000), // 3s in ms
     // blog.cloudflare.com/tls-session-resumption-full-speed-and-secure
     sessionTimeout: 60 * 60 * 24 * 7, // 7d in secs
   };
+  if (allowTlsPsk) {
+    // tlsOpts.enableTrace = true;
+    /**
+     * @param {TLSSocket} _socket - TLS Socket
+     * @param {string} idhex - Identifier in hex
+     * @returns {DataView}
+     */
+    tlsOpts.pskCallback = (_socket, idhex) => {
+      stats.tottlspsk += 1;
+      if (!bufutil.isHex(idhex)) return;
+      if (psk.staticPskCred == null) {
+        stats.tlspskmiss += 1;
+        return null; // unlikely
+      }
+
+      // const idhexhint = psk.staticPskCred.idhexhint;
+      // openssl s_client -reconnect -tls1_2 -psk_identity 790bb45383670663ce9a39480be2de5426179506c8a6b2be922af055896438dd06dd320e68cd81348a32d679c026f73be64fdbbc46c43bfbc0f98160ffae2452
+      // -psk "$TLS_PSK" -connect dns.rethinkdns.localhost:10000 -debug -cipher "PSK-AES128-GCM-SHA256"
+      // TODO: confirm key is compatible with socket.getCipher();
+      if (idhex === psk.staticPskCred.idhex) {
+        stats.tlspsks += 1;
+        const customPsk = bufutil.len(tlsPsk) >= psk.keysize;
+        // log.d("TLS PSK: static id", idhexhint, "custom key?", customPsk);
+        if (customPsk) {
+          return tlsPsk;
+        }
+        return psk.staticPskCred.key;
+      }
+
+      /** @type {psk.PskCred?} */
+      const creds = psk.recentPskCreds.get(idhex);
+      if (creds && creds.ok()) {
+        stats.tlspskd += 1;
+        // log.d("TLS PSK: known client", creds.idhexhint);
+        return creds.key;
+      }
+
+      // async callbacks are not possible yet, and so, generate the
+      // missing credentials in the next microtask and fail this one;
+      // hopefully, the next time this same idhex connects, we'll have
+      // generated the corresponding PSK credentials to serve it.
+      psk.generateTlsPsk(bufutil.hex2buf(idhex));
+      // log.d("TLS PSK: unknown client id", idhex);
+      stats.tlspskmiss += 1;
+      return null;
+    };
+    tlsOpts.pskIdentityHint =
+      psk.staticPskCred == null ? psk.serverid : psk.staticPskCred.idhexhint;
+    log.i("TLS PSK identity hint", tlsOpts.pskIdentityHint);
+  }
   // nodejs.org/api/http2.html#http2createsecureserveroptions-onrequesthandler
   const h2Opts = {
     allowHTTP1: true,
@@ -658,13 +735,11 @@ function trapSecureServerEvents(id, s) {
 
   s.on("resumeSession", (id, next) => {
     const hid = bufutil.hex(id);
-
     const data = tlsSessions.get(hid) || null;
     // log.d("tls: resume;", hid, "ok?", data != null);
     if (data) stats.fasttls += 1;
     else stats.totfasttls += 1;
-
-    next(/* err*/ null, null);
+    next(/* err */ null, data);
   });
 
   // emitted when the req is discarded due to maxConnections
@@ -696,6 +771,9 @@ function rotateTkt(s) {
   const d = new Date();
   const cur = d.getUTCFullYear() + " " + d.getUTCMonth(); // 2023 7
   const ctx = cur + envutil.imageRef();
+
+  log.i("tls: rotating tickets; seed", bufutil.hex(seed), "ctx", ctx);
+  psk.newSession(seed, ctx);
 
   // tls session resumption with tickets (or ids) reduce the 3.5kb to 6.5kb
   // overhead associated with tls handshake: netsekure.org/2010/03/tls-overhead
@@ -906,7 +984,7 @@ function getDnRE(socket) {
  * @return {<[String, String]>} [flag, hostname] - may be empty strings
  */
 function getMetadata(sni) {
-  const fakesni = envutil.allowDomainFronting();
+  const fakesni = envutil.allowDomainFronting() || envutil.allowTlsPsk();
 
   if (util.emptyString(sni)) {
     return ["", fakesni ? "nosni.tld" : ""];
@@ -938,7 +1016,7 @@ function getMetadata(sni) {
  */
 function serveTLS(socket) {
   const sni = socket.servername;
-  if (!envutil.allowDomainFronting()) {
+  if (!envutil.allowDomainFronting() && !envutil.allowTlsPsk()) {
     if (!sni) {
       log.d("no sni, close conn");
       close(socket);
